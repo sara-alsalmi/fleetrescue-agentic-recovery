@@ -1,123 +1,175 @@
 # FleetRescue
 
-FleetRescue is a small, stateful robot-warehouse simulation built for a three-minute recovery-agent demo. Three robots continuously move boxes across a shared two-cell passage. A fault can stop a robot while its passage reservation remains, blocking real engine progress. A bounded Anthropic tool-calling agent investigates, chooses permitted actions, and is judged by code after an observation window.
+**Safety-bounded AI recovery for a shared-passage warehouse fleet.**
 
-## What is implemented
+FleetRescue is a deterministic warehouse simulation in which three autonomous robots share a narrow passage while transporting payloads. A failed robot can retain a stale passage reservation even when it is physically outside the passage, stopping otherwise healthy traffic.
 
-- Deterministic grid engine with actual positions, BFS routes, tasks, reservations, deliveries, and event history.
-- Collision and passage-reservation invariants enforced on every simulation tick.
-- Recoverable stale-reservation, unsafe occupied-passage, and healthy-control scenarios.
-- Small observation/action tool set. Repair tools independently validate their safety preconditions.
-- One bounded Anthropic tool loop: 8 model calls, 14 tool calls, 700 output tokens/call, one retry, and a 40-second wall-clock cap.
-- Independent evaluator requiring at least one new delivery over a 16-tick observation window, zero safety violations, preserved healthy robots/reservations, and escalation of unsafe incidents.
-- Explicit restart-only deterministic baseline that does not clear reservations.
-- Offline unit tests and a separate fixed held-out layout (`seed=41`) whose identity and timing are not put in the model prompt.
-- One-screen React/TypeScript digital twin with a FastAPI adapter, live SVG motion, real tool activity, and verification output.
+The recovery agent does not receive direct access to the engine. It investigates through a small tool interface, selects only validated corrective actions, and then observes the warehouse again. A separate evaluator—not the model—decides whether deliveries resumed without violating safety invariants.
 
-## Setup and exact commands
+## Key capabilities
 
-Python 3.11+ and Node.js 20+ are recommended.
+- Stateful robot positions, routes, payloads, deliveries, reservations, and event history.
+- Collision prevention and exclusive shared-passage occupancy enforced on every tick.
+- Recoverable, unsafe occupied-passage, and healthy-control scenarios.
+- Bounded Anthropic tool-calling loop with token, request, tool-call, timeout, retry, and cost limits.
+- Safety-validated reservation release and robot quarantine tools.
+- Independent post-action evaluation based on physical progress and safety state.
+- React digital twin driven only by FastAPI snapshots from the Python engine.
+- Explicit scene transitions for fault injection and reset, without fabricated movement.
+- Offline unit, safety, request-contract, evaluator, and API integration tests.
 
-```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-Set-Location frontend
-npm install
-Set-Location ..
-Copy-Item .env.example .env
-```
+## Technology
 
-Edit `.env` locally. Supply both `ANTHROPIC_API_KEY` and the exact `FLEETRESCUE_MODEL` ID you selected. The application never guesses a model ID. It loads `.env` through `python-dotenv`; alternatively, set the values in your shell:
-
-```powershell
-$env:ANTHROPIC_API_KEY = "..."
-$env:FLEETRESCUE_MODEL = "exact-model-id"
-```
-
-For local development, start FastAPI in one terminal:
-
-```powershell
-py -3.13 -m uvicorn app:app --host 127.0.0.1 --port 8123
-```
-
-Start Vite in a second terminal:
-
-```powershell
-Set-Location frontend
-npm run dev
-```
-
-Open `http://127.0.0.1:5173`. Vite proxies `/api` requests to FastAPI on loopback port `8123`.
-
-For a single production-style server, build the frontend first, then let FastAPI serve it:
-
-```powershell
-Set-Location frontend
-npm run build
-Set-Location ..
-py -3.13 -m uvicorn app:app --host 127.0.0.1 --port 8123
-```
-
-Open `http://127.0.0.1:8123`.
-
-Run the offline suite (no network or model calls):
-
-```powershell
-py -3.13 -m pytest -q
-Set-Location frontend
-npm run build
-```
-
-Run a minimal engine check:
-
-```powershell
-python -m fleetrescue
-```
+- **Frontend:** React, TypeScript, Vite, SVG
+- **Backend:** FastAPI, Uvicorn, Python
+- **Agent:** Anthropic Claude tool calling
+- **Testing:** pytest and FastAPI TestClient
 
 ## Architecture
 
-`fleetrescue/engine.py` owns all warehouse state and rules. `tools.py` exposes narrow observations/actions without scenario labels or suggested repairs. `agent.py` is the bounded Anthropic loop. `evaluator.py` independently advances the engine and scores physical progress. `app.py` exposes those objects through a narrow FastAPI session API. `frontend/` renders snapshots and recorded tool activity; it cannot manufacture recovery or mutate engine state directly.
-
-The model cannot execute commands, read files, change safety logic, or directly mutate the engine. Full tool traces stay local; the model receives only compact tool results and a short recent-event window.
-
-## Evaluation contract
-
-The evaluation window is 16 ticks and the success threshold is at least one new completed delivery. Any collision or passage-occupancy violation fails verification. Healthy robots must remain active, legitimate active reservations must not be released, and an inactive passage occupant must lead to escalation. Outcomes are `complete`, `incomplete`, `escalated`, or `provider-interrupted`. Model prose is never an input to the score.
-
-The held-out layout uses changed robot IDs (`R4`–`R6`), starts, destinations, and incident timing via `make_scenario(..., seed=41)`. Keep its results out of prompts and do not tune against it.
-
-## Single paid DEV smoke-test plan — not run
-
-After offline tests pass and you explicitly approve spending:
-
-1. Configure the exact model ID and key locally.
-2. Run one recoverable scenario only, with the built-in caps (maximum 8 requests and 5,600 generated tokens; normal expectation is 3–5 requests and well under 2,500 output tokens).
-3. Save the local trace and evaluator result; verify at least one new delivery and zero safety violations.
-4. Stop. Do not run held-out or comparison batches without separate approval.
-
-**Current enforced estimate for `claude-sonnet-5-5`:** no more than **$0.1936** for this single smoke test, with at most 60,000 conservatively estimated input tokens and 5,600 output tokens at the current $2/million input and $10/million output rates, plus a conservative 1.1x regional multiplier. The hard approval ceiling remains **$0.20**. Before every request, the runner reserves a one-token-per-UTF-8-byte input estimate plus 1,024 tokens of protocol overhead and the full requested output allowance. Failed/retried requests retain their reservation. Recheck pricing if the model ID changes. The runner records actual token usage. No paid call has been made by this project.
-
-Preview the guarded plan offline (this makes no API calls):
-
-```powershell
-py -3.13 dev_smoke.py
+```mermaid
+flowchart LR
+    UI[React + SVG operator UI] -->|controls and polling| API[FastAPI session API]
+    API --> Engine[Deterministic warehouse engine]
+    API --> Agent[Bounded Claude agent loop]
+    Agent --> Tools[Validated recovery tools]
+    Tools --> Engine
+    Engine --> Safety[Collision and passage invariants]
+    Engine --> Evaluator[Independent evaluator]
+    Evaluator --> API
+    API -->|engine snapshots and recorded actions| UI
 ```
 
-Only after explicit spending approval, run exactly once with:
+The Python engine is the single source of truth. The frontend cannot move robots, clear reservations, or manufacture recovery results. The model cannot execute commands, read files, or directly mutate simulation state.
+
+## Windows setup
+
+Requirements:
+
+- Python 3.11 or newer
+- Node.js 20 or newer
+- PowerShell
+
+From the repository root:
 
 ```powershell
-py -3.13 dev_smoke.py --execute-paid-dev-smoke
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+Set-Location frontend
+npm.cmd ci
+Set-Location ..
 ```
 
-The runner requires `claude-sonnet-5-5`, uses its current $2/million input and
-$10/million output pricing with a conservative 1.1x regional multiplier, and
-refuses to start if the estimate exceeds $0.20. It writes the tool trace,
-actions, independent verification, token usage, and estimated actual cost to a
-local JSON report under `artifacts/`.
+If Python 3.13 is not installed, replace `py -3.13` with an available Python 3.11+ launcher.
 
-## Scope and limitations
+## Environment configuration
 
-This is a discrete simulation, not a robotics controller. “Physically empty” is exact simulation ground truth, not a real sensor-confidence claim. Robots use fixed tasks and simple shortest paths. There is no database, authentication, cloud deployment, arbitrary code execution, or multi-agent framework. FastAPI process restarts reset in-memory state.
+Create a local configuration file from the safe placeholder example:
 
-See [VIDEO_OUTLINE.md](VIDEO_OUTLINE.md) for the demo sequence and [CRITERIA.md](CRITERIA.md) for evidence status.
+```powershell
+Copy-Item .env.example .env
+```
+
+Set these values locally:
+
+- `ANTHROPIC_API_KEY`: your Anthropic credential.
+- `FLEETRESCUE_MODEL`: the exact model ID permitted for the live run.
+
+Never commit the local `.env`. Offline simulation and test execution do not require a paid API call.
+
+## Run locally
+
+From the repository root, start FastAPI in the first PowerShell window:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8123
+```
+
+From the repository root, start Vite in a second PowerShell window:
+
+```powershell
+Set-Location frontend
+npm.cmd run dev
+```
+
+Open `http://127.0.0.1:5173`. Vite proxies `/api` to FastAPI at `127.0.0.1:8123`.
+
+For a production-style local build:
+
+```powershell
+Set-Location frontend
+npm.cmd run build
+Set-Location ..
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8123
+```
+
+Then open `http://127.0.0.1:8123`.
+
+## Offline validation
+
+The following commands make no Anthropic API calls:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+
+Set-Location frontend
+npm.cmd run build
+```
+
+The four UI controls are backed by tested API operations:
+
+- **Start Simulation** advances the real engine.
+- **Inject Fault** loads the recoverable incident as an explicit scene transition.
+- **Run Recovery Agent** starts the configured bounded agent only after a fault exists.
+- **Reset** restores a clean deterministic scenario.
+
+The guarded smoke-test plan can be inspected offline with:
+
+```powershell
+.\.venv\Scripts\python.exe dev_smoke.py
+```
+
+Do not use its paid execution flag without explicit authorization and valid local configuration.
+
+## Evaluation evidence
+
+### Offline coverage
+
+The test suite covers normal delivery progress, collision and passage invariants, unsafe occupied-passage escalation, preservation of healthy reservations, bounded agent behavior, sanitized provider failures, Anthropic request structure, API synchronization, rapid control transitions, and mocked recovery traces.
+
+### Live Claude result
+
+One authorized paid DEV smoke test used the real `claude-sonnet-5-5` tool-calling agent on the corrected recoverable scenario. This is a record of **one successful live recovery test**, not a benchmark or general success rate.
+
+- Independent outcome: **COMPLETE**
+- New deliveries during independent verification: **3**
+- Safety violations: **0**
+- Both healthy robots resumed operations.
+
+The agent investigated robot state, physical passage occupancy, and reservation ownership before releasing the stale reservation. Independent verification then advanced the engine and measured delivery recovery. The failed robot remained outside the passage and was not moved by the repair.
+
+## Safety model
+
+- A reservation cannot be released unless the passage is physically empty and the owner satisfies inactivity checks.
+- An inactive robot occupying the passage is treated as unsafe and requires escalation.
+- Retries and correction attempts share the same run limits.
+- The guarded runner stops issuing requests after its timeout or before a request could exceed the configured budget.
+- Model prose is never accepted as proof of recovery; only evaluator-observed engine state determines the outcome.
+
+## Current limitations
+
+- Three-robot deterministic simulation.
+- Fixed delivery tasks and shortest-path routes.
+- In-memory state that resets when the FastAPI process restarts.
+- No authentication, persistence, deployment layer, or multi-tenant operation.
+- No physical robotics, sensor, PLC, or warehouse-management-system integration.
+- Simulated physical occupancy is exact ground truth rather than a real sensor-confidence estimate.
+
+## Future improvements
+
+- Persist incident and evaluation history.
+- Add configurable layouts and larger fleet workloads.
+- Introduce sensor uncertainty and delayed telemetry in a separate evaluation mode.
+- Integrate with a robotics simulator before considering real warehouse hardware.
