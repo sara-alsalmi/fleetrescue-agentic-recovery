@@ -12,16 +12,19 @@ FleetRescue is a small, stateful robot-warehouse simulation built for a three-mi
 - Independent evaluator requiring at least one new delivery over a 16-tick observation window, zero safety violations, preserved healthy robots/reservations, and escalation of unsafe incidents.
 - Explicit restart-only deterministic baseline that does not clear reservations.
 - Offline unit tests and a separate fixed held-out layout (`seed=41`) whose identity and timing are not put in the model prompt.
-- One-screen Streamlit UI with live simulation, real tool activity, and verification output.
+- One-screen React/TypeScript digital twin with a FastAPI adapter, live SVG motion, real tool activity, and verification output.
 
 ## Setup and exact commands
 
-Python 3.11+ is recommended.
+Python 3.11+ and Node.js 20+ are recommended.
 
 ```powershell
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+Set-Location frontend
+npm install
+Set-Location ..
 Copy-Item .env.example .env
 ```
 
@@ -30,13 +33,40 @@ Edit `.env` locally. Supply both `ANTHROPIC_API_KEY` and the exact `FLEETRESCUE_
 ```powershell
 $env:ANTHROPIC_API_KEY = "..."
 $env:FLEETRESCUE_MODEL = "exact-model-id"
-streamlit run app.py
 ```
+
+For local development, start FastAPI in one terminal:
+
+```powershell
+py -3.13 -m uvicorn app:app --host 127.0.0.1 --port 8123
+```
+
+Start Vite in a second terminal:
+
+```powershell
+Set-Location frontend
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. Vite proxies `/api` requests to FastAPI on loopback port `8123`.
+
+For a single production-style server, build the frontend first, then let FastAPI serve it:
+
+```powershell
+Set-Location frontend
+npm run build
+Set-Location ..
+py -3.13 -m uvicorn app:app --host 127.0.0.1 --port 8123
+```
+
+Open `http://127.0.0.1:8123`.
 
 Run the offline suite (no network or model calls):
 
 ```powershell
-pytest -q
+py -3.13 -m pytest -q
+Set-Location frontend
+npm run build
 ```
 
 Run a minimal engine check:
@@ -47,7 +77,7 @@ python -m fleetrescue
 
 ## Architecture
 
-`fleetrescue/engine.py` owns all warehouse state and rules. `tools.py` exposes narrow observations/actions without scenario labels or suggested repairs. `agent.py` is the bounded Anthropic loop. `evaluator.py` independently advances the engine and scores physical progress. `app.py` only presents state and starts work; it cannot manufacture recovery.
+`fleetrescue/engine.py` owns all warehouse state and rules. `tools.py` exposes narrow observations/actions without scenario labels or suggested repairs. `agent.py` is the bounded Anthropic loop. `evaluator.py` independently advances the engine and scores physical progress. `app.py` exposes those objects through a narrow FastAPI session API. `frontend/` renders snapshots and recorded tool activity; it cannot manufacture recovery or mutate engine state directly.
 
 The model cannot execute commands, read files, change safety logic, or directly mutate the engine. Full tool traces stay local; the model receives only compact tool results and a short recent-event window.
 
@@ -88,6 +118,6 @@ local JSON report under `artifacts/`.
 
 ## Scope and limitations
 
-This is a discrete simulation, not a robotics controller. “Physically empty” is exact simulation ground truth, not a real sensor-confidence claim. Robots use fixed tasks and simple shortest paths. There is no database, authentication, cloud deployment, arbitrary code execution, or multi-agent framework. Streamlit process restarts reset in-memory state.
+This is a discrete simulation, not a robotics controller. “Physically empty” is exact simulation ground truth, not a real sensor-confidence claim. Robots use fixed tasks and simple shortest paths. There is no database, authentication, cloud deployment, arbitrary code execution, or multi-agent framework. FastAPI process restarts reset in-memory state.
 
 See [VIDEO_OUTLINE.md](VIDEO_OUTLINE.md) for the demo sequence and [CRITERIA.md](CRITERIA.md) for evidence status.

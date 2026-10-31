@@ -1,153 +1,220 @@
 from __future__ import annotations
 
-import html
-import os
-from threading import Event, Thread
+from dataclasses import asdict
+from pathlib import Path
+from threading import Event, RLock, Thread
 
-import streamlit as st
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from fleetrescue.agent import AnthropicProvider, RecoveryAgent
-from fleetrescue.engine import HEIGHT, PASSAGE, STATIONS, WIDTH
+from fleetrescue.agent import AgentRun, AnthropicProvider, RecoveryAgent
+from fleetrescue.engine import HEIGHT, PASSAGE, STATIONS, WIDTH, is_floor
 from fleetrescue.scenarios import make_scenario
 from fleetrescue.tools import RecoveryTools
 
-st.set_page_config(page_title="FleetRescue", page_icon="FR", layout="wide")
-load_dotenv()
-st.markdown("""
-<style>
-:root { --navy:#071522; --panel:#0d2232; --teal:#23d5c3; --muted:#8ea5b7; }
-.stApp { background:var(--navy); color:#eef8fb; }
-[data-testid="stMetric"] { background:#0d2232; border:1px solid #17384b; padding:12px; border-radius:12px; }
-.mode { display:inline-block; padding:5px 10px; border-radius:999px; background:#123044; color:#8ff5e9; font-size:.78rem; }
-.activity { background:#0b1d2b; border-left:3px solid #23d5c3; padding:9px 12px; margin:6px 0; border-radius:5px; }
-.subtle { color:#8ea5b7; font-size:.88rem; }
-</style>""", unsafe_allow_html=True)
+
+class FleetSession:
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.version = 0
+        self.scene_id = 0
+        self.scene_reason = "initial"
+        self.provider_mode = "live"
+        self.reset()
+
+    def _touch(self) -> None:
+        self.version += 1
+
+    def reset(self) -> None:
+        with self.lock:
+            self.scene_id += 1
+            self.scene_reason = "reset"
+            self.engine = make_scenario("normal")
+            self.engine.running = False
+            self.activity: list[dict[str, object]] = []
+            self.agent_running = False
+            self.result: AgentRun | dict[str, object] | None = None
+            self.cancel = Event()
+            self.incident_position: tuple[int, int] | None = None
+            self._touch()
+
+    def inject_fault(self) -> None:
+        with self.lock:
+            if self.agent_running:
+                raise RuntimeError("Recovery agent is running")
+            self.engine = make_scenario("recoverable")
+            self.scene_id += 1
+            self.scene_reason = "fault"
+            owner = self.engine.reservation.owner if self.engine.reservation else None
+            self.incident_position = self.engine.robots[owner].position if owner else None
+            self.activity = []
+            self.result = None
+            self.cancel = Event()
+            self._touch()
+
+    def record(self, item: dict[str, object]) -> None:
+        with self.lock:
+            self.activity.append(item)
+            self._touch()
+
+    def start_agent(self) -> None:
+        with self.lock:
+            if self.agent_running:
+                raise RuntimeError("Recovery agent is already running")
+            if not self.engine.injected:
+                raise RuntimeError("Inject a fault before running recovery")
+            self.agent_running = True
+            self.result = None
+            self._touch()
+            Thread(target=self._run_agent, daemon=True).start()
+
+    def _run_agent(self) -> None:
+        try:
+            provider = AnthropicProvider()
+            result: AgentRun | dict[str, object] = RecoveryAgent(
+                RecoveryTools(self.engine), provider, activity=self.record
+            ).run(self.cancel)
+        except Exception as exc:
+            result = {
+                "status": "provider-interrupted",
+                "summary": "Live agent could not start",
+                "error": f"{type(exc).__name__}: provider initialization failed",
+            }
+        with self.lock:
+            self.result = result
+            self.agent_running = False
+            self._touch()
+
+    def tick(self) -> None:
+        with self.lock:
+            if self.engine.running and not self.agent_running:
+                self.engine.tick()
+                self._touch()
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock, self.engine._lock:
+            reservation = self.engine.reservation
+            robots = [
+                {
+                    "id": robot.robot_id,
+                    "position": list(robot.position),
+                    "mode": robot.mode.value,
+                    "status": robot.status,
+                    "carrying": robot.carrying,
+                    "deliveries": robot.deliveries,
+                    "route": [list(point) for point in robot.route[:14]],
+                    "heading": self._heading(robot.position, robot.route),
+                    "motionlessTicks": self.engine.tick_count - robot.last_progress_tick,
+                }
+                for robot in self.engine.robots.values()
+            ]
+            if isinstance(self.result, AgentRun):
+                result: dict[str, object] | None = {
+                    "status": self.result.status,
+                    "summary": self.result.summary,
+                    "inputTokens": self.result.input_tokens,
+                    "outputTokens": self.result.output_tokens,
+                    "error": self.result.error,
+                    "evaluation": asdict(self.result.evaluation) if self.result.evaluation else None,
+                }
+            else:
+                result = self.result
+            return {
+                "version": self.version,
+                "sceneId": self.scene_id,
+                "sceneReason": self.scene_reason,
+                "providerMode": self.provider_mode,
+                "tick": self.engine.tick_count,
+                "running": self.engine.running,
+                "injected": self.engine.injected,
+                "agentRunning": self.agent_running,
+                "deliveries": self.engine.total_deliveries,
+                "safetyViolations": self.engine.safety.violations,
+                "escalated": self.engine.escalated,
+                "reservation": None if reservation is None else {
+                    "owner": reservation.owner,
+                    "age": self.engine.tick_count - reservation.acquired_tick,
+                },
+                "incidentPosition": list(self.incident_position) if self.incident_position else None,
+                "robots": robots,
+                "events": [event.public() for event in self.engine.events[-14:]],
+                "activity": list(self.activity),
+                "result": result,
+                "layout": {
+                    "width": WIDTH,
+                    "height": HEIGHT,
+                    "passage": [list(point) for point in sorted(PASSAGE)],
+                    "stations": {name: list(point) for name, point in STATIONS.items()},
+                    "floor": [[x, y] for y in range(HEIGHT) for x in range(WIDTH) if is_floor((x, y))],
+                },
+            }
+
+    @staticmethod
+    def _heading(position: tuple[int, int], route: list[tuple[int, int]]) -> str:
+        if not route:
+            return "idle"
+        dx = route[0][0] - position[0]
+        dy = route[0][1] - position[1]
+        return {(1, 0): "east", (-1, 0): "west", (0, 1): "south", (0, -1): "north"}.get((dx, dy), "idle")
 
 
-def reset() -> None:
-    st.session_state.engine = make_scenario("normal")
-    st.session_state.engine.running = False
-    st.session_state.activity = []
-    st.session_state.agent_job = {"running": False, "result": None}
-    st.session_state.cancel = Event()
+session = FleetSession()
+app = FastAPI(title="FleetRescue", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-if "engine" not in st.session_state:
-    reset()
+@app.get("/api/state")
+def get_state() -> dict[str, object]:
+    return session.snapshot()
 
 
-def warehouse_svg(engine) -> str:
-    cell, pad = 62, 16
-    width, height = WIDTH * cell + pad * 2, HEIGHT * cell + pad * 2
-    station_at = {position: name for name, position in STATIONS.items()}
-    robot_colors = ["#23d5c3", "#ffbd59", "#9b8cff", "#4fa3ff", "#ff718d", "#7ed957"]
-    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="Warehouse map">',
-             '<rect width="100%" height="100%" rx="18" fill="#091b29"/>']
-    for y in range(HEIGHT):
-        for x in range(WIDTH):
-            px, py = pad + x * cell, pad + y * cell
-            floor = x <= 4 or x >= 7 or (x, y) in PASSAGE
-            fill = "#113449" if (x, y) in PASSAGE else ("#0e293b" if floor else "#06121d")
-            stroke = "#23d5c3" if (x, y) in PASSAGE else "#17384b"
-            parts.append(f'<rect x="{px}" y="{py}" width="{cell-3}" height="{cell-3}" rx="7" fill="{fill}" stroke="{stroke}"/>')
-            if (x, y) in station_at:
-                label = station_at[(x, y)]
-                parts.append(f'<rect x="{px+9}" y="{py+9}" width="{cell-21}" height="{cell-21}" rx="5" fill="#17465a"/>')
-                parts.append(f'<text x="{px+cell/2}" y="{py+cell/2+6}" text-anchor="middle" fill="#9eece4" font-size="17" font-weight="700">{label}</text>')
-    parts.append(f'<text x="{pad+6*cell}" y="{pad+3*cell-8}" text-anchor="middle" fill="#72dcd1" font-size="11">SHARED PASSAGE</text>')
-    for index, robot in enumerate(engine.robots.values()):
-        x, y = robot.position
-        cx, cy = pad + x * cell + (cell-3)/2, pad + y * cell + (cell-3)/2
-        color = robot_colors[index % len(robot_colors)]
-        opacity = ".45" if robot.mode.value != "active" else "1"
-        parts.append(f'<circle cx="{cx}" cy="{cy}" r="20" fill="{color}" opacity="{opacity}" stroke="#eef8fb" stroke-width="2"/>')
-        parts.append(f'<text x="{cx}" y="{cy+5}" text-anchor="middle" fill="#06121d" font-size="12" font-weight="800">{html.escape(robot.robot_id)}</text>')
-        if robot.carrying:
-            parts.append(f'<rect x="{cx+13}" y="{cy-26}" width="13" height="13" fill="#f0d77a" stroke="#fff1b3"/>')
-    parts.append('</svg>')
-    return "".join(parts)
+@app.post("/api/start")
+def start_simulation() -> dict[str, object]:
+    with session.lock:
+        session.engine.running = True
+        session.engine.log("system", "Simulation resumed")
+        session._touch()
+    return session.snapshot()
 
 
-def run_agent(engine, activity: list[dict[str, object]], cancel: Event, job: dict[str, object]) -> None:
-    # The background thread receives plain shared objects; it never calls Streamlit APIs.
-    def record(item: dict[str, object]) -> None:
-        activity.append(item)
+@app.post("/api/tick")
+def tick_simulation() -> dict[str, object]:
+    session.tick()
+    return session.snapshot()
+
+
+@app.post("/api/fault")
+def inject_fault() -> dict[str, object]:
     try:
-        provider = AnthropicProvider()
-        result = RecoveryAgent(RecoveryTools(engine), provider, activity=record).run(cancel)
-    except Exception as exc:
-        result = {"status": "provider-interrupted", "summary": "Live agent could not start", "error": str(exc)}
-    job["result"] = result
-    job["running"] = False
+        session.inject_fault()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return session.snapshot()
 
 
-st.title("FleetRescue")
-st.caption("A real stateful warehouse simulation with safety-validated AI recovery")
-
-engine = st.session_state.engine
-job = st.session_state.agent_job
-top = st.columns([1.2, 1, 1, 1])
-top[0].markdown('<span class="mode">DETERMINISTIC SIMULATION</span>', unsafe_allow_html=True)
-top[1].metric("Tick", engine.tick_count)
-top[2].metric("Deliveries", engine.total_deliveries)
-top[3].metric("Passage", engine.reservation.owner if engine.reservation else "Available")
-
-buttons = st.columns(4)
-if buttons[0].button("Start simulation", type="primary", use_container_width=True, disabled=engine.running):
-    engine.running = True
-    engine.log("system", "Simulation resumed")
-if buttons[1].button("Inject fault", use_container_width=True, disabled=engine.injected or job["running"]):
+@app.post("/api/recover", status_code=202)
+def run_recovery() -> dict[str, object]:
     try:
-        owner = engine.inject_stale_reservation()
-        st.session_state.activity.append({"tool": "fault injection", "result": f"{owner} stopped; reservation remains"})
-    except ValueError as exc:
-        st.warning(str(exc))
-if buttons[2].button("Run recovery agent", use_container_width=True,
-                     disabled=job["running"] or not engine.injected):
-    job["running"] = True
-    job["result"] = None
-    thread = Thread(target=run_agent, args=(engine, st.session_state.activity, st.session_state.cancel, job), daemon=True)
-    thread.start()
-if buttons[3].button("Reset", use_container_width=True, disabled=job["running"]):
-    reset()
-    st.rerun()
+        session.start_agent()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return session.snapshot()
 
 
-@st.fragment(run_every=0.35)
-def live_panel() -> None:
-    engine = st.session_state.engine
-    job = st.session_state.agent_job
-    if engine.running and not job["running"]:
-        engine.tick()
-    left, right = st.columns([1.65, 1])
-    with left:
-        st.markdown(warehouse_svg(engine), unsafe_allow_html=True)
-        cols = st.columns(len(engine.robots))
-        for col, robot in zip(cols, engine.robots.values()):
-            col.markdown(f"**{robot.robot_id}** · {robot.mode.value}<br><span class='subtle'>{html.escape(robot.status)} · {robot.deliveries} delivered</span>", unsafe_allow_html=True)
-    with right:
-        connected = bool(os.getenv("ANTHROPIC_API_KEY", "").strip() and os.getenv("FLEETRESCUE_MODEL", "").strip())
-        label = "REAL MODEL RUNNING" if job["running"] else ("REAL MODEL CONFIGURED" if connected else "LIVE MODEL NOT CONFIGURED")
-        st.markdown(f'<span class="mode">{label}</span>', unsafe_allow_html=True)
-        st.subheader("Agent activity")
-        if not st.session_state.activity:
-            st.caption("Actual tool calls will appear here. Offline mocks are used only in tests.")
-        for item in st.session_state.activity[-7:]:
-            name = html.escape(str(item.get("tool", "event")))
-            result = html.escape(str(item.get("result", "")))
-            st.markdown(f'<div class="activity"><b>{name}</b><br><span class="subtle">{result[:280]}</span></div>', unsafe_allow_html=True)
-        result = job["result"]
-        if result:
-            st.subheader("Independent verification")
-            if isinstance(result, dict):
-                st.error(f"{result['summary']}: {result.get('error', '')}")
-            elif result.evaluation:
-                ev = result.evaluation
-                (st.success if ev.outcome == "complete" else st.warning)(
-                    f"{ev.outcome.upper()} · +{ev.new_deliveries} deliveries · {ev.safety_violations} safety violations"
-                )
-                st.caption(f"Provider: {ev.provider} · Model: {ev.model} · Tokens: {ev.input_tokens} in / {ev.output_tokens} out")
+@app.post("/api/reset")
+def reset_simulation() -> dict[str, object]:
+    if session.agent_running:
+        raise HTTPException(status_code=409, detail="Recovery agent is running")
+    session.reset()
+    return session.snapshot()
 
 
-live_panel()
+frontend = Path(__file__).parent / "frontend" / "dist"
+if frontend.exists():
+    app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
