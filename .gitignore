@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*.json
+secrets*.json
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+artifacts/
+.uv-cache/
+.uv-python/
