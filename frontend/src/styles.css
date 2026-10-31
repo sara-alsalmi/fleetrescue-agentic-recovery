@@ -108,6 +108,8 @@ button { font: inherit; }
 .verification-grid > div { display: flex; flex-direction: column; padding-left: 8px; border-left: 1px solid #31514f; }
 .verification-grid b { font-size: 13px; color: #e1efef; }
 .verification-grid span { margin-top: 2px; color: #66827e; font-size: 7px; text-transform: uppercase; }
+.verification-note { margin: 11px 0 0; padding-top: 10px; border-top: 1px solid #31514f; color: #8fb2ae; font-size: 8px; line-height: 1.45; }
+.run-meta { margin: 7px 0 0; color: #607f7d; font-size: 7px; letter-spacing: .03em; }
 
 .control-bar { position: relative; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 24px; padding: 0 24px 0 28px; border-top: 1px solid #17313f; background: #07141d; }
 .control-context span { color: #5e7b87; font-size: 8px; font-weight: 850; letter-spacing: .17em; }

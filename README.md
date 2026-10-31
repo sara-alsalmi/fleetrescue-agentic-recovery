@@ -15,6 +15,8 @@ The recovery agent does not receive direct access to the engine. It investigates
 - Safety-validated reservation release and robot quarantine tools.
 - Independent post-action evaluation based on physical progress and safety state.
 - React digital twin driven only by FastAPI snapshots from the Python engine.
+- Server-owned simulation clock that cannot be accelerated by multiple browser tabs.
+- Browser resynchronization after backend restarts through a per-process instance identifier.
 - Explicit scene transitions for fault injection and reset, without fabricated movement.
 - Offline unit, safety, request-contract, evaluator, and API integration tests.
 
@@ -29,8 +31,9 @@ The recovery agent does not receive direct access to the engine. It investigates
 
 ```mermaid
 flowchart LR
-    UI[React + SVG operator UI] -->|controls and polling| API[FastAPI session API]
+    UI[React + SVG operator UI] -->|controls and read-only state polling| API[FastAPI session API]
     API --> Engine[Deterministic warehouse engine]
+    Clock[Single server clock] --> Engine
     API --> Agent[Bounded Claude agent loop]
     Agent --> Tools[Validated recovery tools]
     Tools --> Engine
@@ -77,7 +80,7 @@ Set these values locally:
 - `ANTHROPIC_API_KEY`: your Anthropic credential.
 - `FLEETRESCUE_MODEL`: the exact model ID permitted for the live run.
 
-Never commit the local `.env`. Offline simulation and test execution do not require a paid API call.
+The guarded live endpoint currently requires `claude-sonnet-5-5`, whose configured pricing is used for the cost ceiling. Never commit the local `.env`. Offline simulation and test execution do not require a paid API call.
 
 ## Run locally
 
@@ -137,18 +140,20 @@ Do not use its paid execution flag without explicit authorization and valid loca
 
 ### Offline coverage
 
-The test suite covers normal delivery progress, collision and passage invariants, unsafe occupied-passage escalation, preservation of healthy reservations, bounded agent behavior, sanitized provider failures, Anthropic request structure, API synchronization, rapid control transitions, and mocked recovery traces.
+The 28-test suite covers normal delivery progress, collision and passage invariants, unsafe occupied-passage escalation, preservation of healthy reservations, bounded agent behavior, sanitized provider failures, Anthropic request structure, API synchronization, rapid control transitions, multi-client clock protection, backend restart identity, and mocked recovery traces. TypeScript checking and the Vite production build also pass.
 
-### Live Claude result
+### Live Claude results
 
-One authorized paid DEV smoke test used the real `claude-sonnet-5-5` tool-calling agent on the corrected recoverable scenario. This is a record of **one successful live recovery test**, not a benchmark or general success rate.
+Two separately authorized paid DEV validations used the real `claude-sonnet-5-5` tool-calling agent on the recoverable scenario. These are individual validation records, not a benchmark or a general success rate.
 
-- Independent outcome: **COMPLETE**
-- New deliveries during independent verification: **3**
-- Safety violations: **0**
-- Both healthy robots resumed operations.
+| Validation | Outcome | New deliveries | Safety violations | Healthy robots |
+|---|---:|---:|---:|---|
+| Corrected-scenario smoke test | **COMPLETE** | 3 | 0 | Both resumed |
+| Final synchronized UI/API flow | **COMPLETE** | 2 | 0 | Both preserved and resumed |
 
-The agent investigated robot state, physical passage occupancy, and reservation ownership before releasing the stale reservation. Independent verification then advanced the engine and measured delivery recovery. The failed robot remained outside the passage and was not moved by the repair.
+The final synchronized run used 6 API attempts, 13,252 input tokens, and 825 output tokens, with an estimated cost of `$0.038229` under the enforced `$0.20` ceiling. The agent inspected robot state, physical passage occupancy, recent events, and reservation ownership before releasing the stale reservation, then performed two progress observations. Independent verification measured actual delivery recovery.
+
+R3 remains physically stationary at `(9,6)` by design because it represents the failed robot. The safe software repair removes R3's stale logical reservation so healthy R1 and R2 can resume; it does not fabricate a physical hardware repair.
 
 ## Safety model
 
@@ -156,6 +161,7 @@ The agent investigated robot state, physical passage occupancy, and reservation 
 - An inactive robot occupying the passage is treated as unsafe and requires escalation.
 - Retries and correction attempts share the same run limits.
 - The guarded runner stops issuing requests after its timeout or before a request could exceed the configured budget.
+- The live UI endpoint uses the same pre-request reservation guard and displays the model, API attempts, and estimated cost.
 - Model prose is never accepted as proof of recovery; only evaluator-observed engine state determines the outcome.
 
 ## Current limitations
@@ -165,6 +171,7 @@ The agent investigated robot state, physical passage occupancy, and reservation 
 - In-memory state that resets when the FastAPI process restarts.
 - No authentication, persistence, deployment layer, or multi-tenant operation.
 - No physical robotics, sensor, PLC, or warehouse-management-system integration.
+- Failed robots remain stationary until a separate physical maintenance workflow exists.
 - Simulated physical occupancy is exact ground truth rather than a real sensor-confidence estimate.
 
 ## Future improvements

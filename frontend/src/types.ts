@@ -36,9 +36,14 @@ export interface AgentResult {
   outputTokens?: number
   error?: string | null
   evaluation?: Evaluation | null
+  modelId?: string | null
+  apiAttempts?: number
+  estimatedCostUsd?: number
+  costCeilingUsd?: number
 }
 
 export interface FleetState {
+  serverId: string
   version: number
   sceneId: number
   sceneReason: 'initial' | 'reset' | 'fault'

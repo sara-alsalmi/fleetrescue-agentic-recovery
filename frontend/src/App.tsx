@@ -13,6 +13,8 @@ function Warehouse({ state, motionMode }: { state: FleetState; motionMode: 'step
   const floor = new Set(state.layout.floor.map(([x, y]) => `${x}:${y}`))
   const passage = new Set(state.layout.passage.map(([x, y]) => `${x}:${y}`))
   const stationAt = new Map(Object.entries(state.layout.stations).map(([name, point]) => [`${point[0]}:${point[1]}`, name]))
+  const reservationOwner = state.robots.find((robot) => robot.id === state.reservation?.owner)
+  const staleReservation = !!state.reservation && reservationOwner?.mode !== 'active'
 
   return (
     <svg className={`warehouse ${motionMode}`} viewBox="0 0 1040 620" role="img" aria-label="Live top-down warehouse simulation">
@@ -78,7 +80,7 @@ function Warehouse({ state, motionMode }: { state: FleetState; motionMode: 'step
       <g className={state.reservation ? 'reservation active' : 'reservation'}>
         <rect x={ox + 5 * cellW - 5} y={oy + 3 * cellH - 5} width={cellW * 2 + 10} height={cellH + 10} rx="12" fill="none" stroke="#43ddd1" strokeWidth="3" />
         <text x={ox + 6 * cellW} y={oy + 3 * cellH - 16} textAnchor="middle">
-          {state.reservation ? `PASSAGE HELD · ${state.reservation.owner}` : 'SHARED PASSAGE · CLEAR'}
+          {state.reservation ? `${staleReservation ? 'STALE LOCK' : 'PASSAGE RESERVED'} · ${state.reservation.owner}` : 'SHARED PASSAGE · CLEAR'}
         </text>
       </g>
 
@@ -155,6 +157,8 @@ function activityStage(item: Activity) {
 function AgentPanel({ state }: { state: FleetState }) {
   const phase = state.result?.status ?? (state.agentRunning ? 'running' : state.injected ? 'incident' : 'standby')
   const evaluation = state.result?.evaluation
+  const inactive = state.robots.filter((robot) => robot.mode !== 'active').map((robot) => robot.id)
+  const active = state.robots.filter((robot) => robot.mode === 'active').map((robot) => robot.id)
   return (
     <aside className="agent-panel">
       <div className="panel-heading">
@@ -199,6 +203,8 @@ function AgentPanel({ state }: { state: FleetState }) {
         <div className={`verification ${state.result.status}`}>
           <div className="verification-title"><span>{state.result.status === 'complete' ? '✓' : '!'}</span><div><small>INDEPENDENT VERIFICATION</small><strong>{state.result.status.toUpperCase()}</strong></div></div>
           {evaluation && <div className="verification-grid"><div><b>+{evaluation.new_deliveries}</b><span>deliveries</span></div><div><b>{evaluation.safety_violations}</b><span>violations</span></div><div><b>{evaluation.healthy_robots_preserved ? 'YES' : 'NO'}</b><span>fleet preserved</span></div></div>}
+          {state.result.status === 'complete' && <p className="verification-note">{active.join(' and ')} resumed delivery work. {inactive.length ? `${inactive.join(' and ')} remains safely stationary after failure.` : 'All robots remain active.'}</p>}
+          {state.result.modelId && <p className="run-meta">{state.result.modelId} · {state.result.apiAttempts ?? 0} API attempts · ${Number(state.result.estimatedCostUsd ?? 0).toFixed(4)} estimated</p>}
         </div>
       )}
     </aside>
@@ -211,6 +217,7 @@ function App() {
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const latestVersion = useRef(-1)
+  const latestServer = useRef<string | null>(null)
   const latestState = useRef<FleetState | null>(null)
 
   const request = useCallback(async (path: string, method = 'GET') => {
@@ -218,10 +225,12 @@ function App() {
     const body = await response.json()
     if (!response.ok) throw new Error(body.detail ?? 'Request failed')
     const next = body as FleetState
-    if (next.version >= latestVersion.current) {
+    const changedServer = latestServer.current !== null && next.serverId !== latestServer.current
+    if (latestServer.current === null || changedServer || next.version >= latestVersion.current) {
       const previous = latestState.current
-      const singleEngineStep = !!previous && previous.sceneId === next.sceneId && next.tick - previous.tick <= 1 && next.tick >= previous.tick
+      const singleEngineStep = !changedServer && !!previous && previous.sceneId === next.sceneId && next.tick - previous.tick <= 1 && next.tick >= previous.tick
       setMotionMode(singleEngineStep ? 'step' : 'snap')
+      latestServer.current = next.serverId
       latestVersion.current = next.version
       latestState.current = next
       setState(next)
@@ -238,13 +247,11 @@ function App() {
   useEffect(() => { request('/state').catch(() => setError('FastAPI backend is unavailable.')) }, [request])
   useEffect(() => {
     if (!state) return
-    const path = state.running && !state.agentRunning ? '/tick' : '/state'
-    const method = path === '/tick' ? 'POST' : 'GET'
-    const delay = state.agentRunning ? 300 : state.running ? 520 : 1200
+    const delay = state.agentRunning ? 250 : state.running ? 180 : 1200
     let cancelled = false
     let timer = 0
     const poll = async () => {
-      try { await request(path, method) } catch { setError('Connection to the engine was lost.') }
+      try { await request('/state'); setError(null) } catch { setError('Connection to the engine was lost.') }
       if (!cancelled) timer = window.setTimeout(poll, delay)
     }
     timer = window.setTimeout(poll, delay)
@@ -256,12 +263,16 @@ function App() {
     if (state.result?.status === 'complete') return ['RECOVERY VERIFIED', 'success']
     if (state.result?.status === 'escalated') return ['HUMAN REVIEW REQUIRED', 'warning']
     if (state.agentRunning) return ['AUTONOMOUS RECOVERY ACTIVE', 'active']
-    if (state.injected && state.reservation) return ['TRAFFIC INCIDENT', 'danger']
+    const owner = state.robots.find((robot) => robot.id === state.reservation?.owner)
+    if (state.injected && state.reservation && owner?.mode !== 'active') return ['TRAFFIC INCIDENT', 'danger']
     if (state.running) return ['OPERATIONS LIVE', 'success']
     return ['SYSTEM READY', 'neutral']
   }, [state])
 
   if (!state) return <div className="loading-screen"><img className="loading-logo" src="/brand/fleetrescue-app-icon.svg" alt="FleetRescue" /><span>Connecting to warehouse engine…</span>{error && <p>{error}</p>}</div>
+
+  const reservationOwner = state.robots.find((robot) => robot.id === state.reservation?.owner)
+  const staleReservation = !!state.reservation && reservationOwner?.mode !== 'active'
 
   return (
     <main className="app-shell">
@@ -272,14 +283,14 @@ function App() {
           <div><span>SIM TICK</span><strong>{String(state.tick).padStart(3, '0')}</strong></div>
           <div><span>DELIVERIES</span><strong>{state.deliveries}</strong></div>
           <div><span>SAFETY</span><strong className={state.safetyViolations ? 'bad' : ''}>{state.safetyViolations ? `${state.safetyViolations} ALERTS` : 'NOMINAL'}</strong></div>
-          <div><span>PASSAGE</span><strong>{state.reservation ? `HELD · ${state.reservation.owner}` : 'AVAILABLE'}</strong></div>
+          <div><span>PASSAGE</span><strong className={staleReservation ? 'bad' : ''}>{state.reservation ? `${staleReservation ? 'STALE' : 'RESERVED'} · ${state.reservation.owner}` : 'AVAILABLE'}</strong></div>
         </div>
       </header>
 
       <section className="workspace">
         <section className="simulation-panel">
           <div className="simulation-heading"><div><span className="eyebrow">LIVE DIGITAL TWIN</span><h2>Fulfillment floor · Sector 07</h2></div><div className="live-indicator"><i />ENGINE STATE</div></div>
-          {state.injected && state.reservation && <div className="incident-banner"><span>!</span><div><small>INCIDENT SCENE LOADED · ENGINE SNAPSHOT</small><strong>STALE RESERVATION DETECTED</strong><p>{state.reservation.owner} is inactive while retaining shared passage access. Healthy traffic is waiting.</p></div><b>{state.reservation.age} TICKS</b></div>}
+          {state.injected && state.reservation && staleReservation && <div className="incident-banner"><span>!</span><div><small>INCIDENT SCENE LOADED · ENGINE SNAPSHOT</small><strong>STALE RESERVATION DETECTED</strong><p>{state.reservation.owner} is inactive while retaining shared passage access. Healthy traffic is waiting.</p></div><b>{state.reservation.age} TICKS</b></div>}
           <Warehouse key={state.sceneId} state={state} motionMode={motionMode} />
         </section>
         <AgentPanel state={state} />
